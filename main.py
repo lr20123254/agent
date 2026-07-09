@@ -102,7 +102,7 @@ prompt = ChatPromptTemplate.from_messages([
         "2. 如果连续 2 次工具调用仍无满意结果，直接告诉用户没找到\n"
         "3. 不要反复调用同一个工具、同一个查询超过 2 次\n"
         "4. 知识库中没有的东西，就说没有，不要换着关键词反复搜\n\n"
-        "请用中文回答，简洁清晰。在需要时主动使用工具。"
+		"请用中文回答，简洁清晰。在需要时主动使用工具。"
     ),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{input}"),
@@ -335,9 +335,9 @@ def main():
 
         try:
             print("\n[思考中...]")
-            # 注入当前时间到用户输入，让 Agent 感知实时时间
+            # 注入当前时间到用户输入开头，让 Agent 清晰感知
             now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
-            time_tagged_input = f"{user_input}\n\n（当前时间: {now_str}）"
+            time_tagged_input = f"[当前时间: {now_str}] {user_input}"
             response = agent_executor.invoke({"input": time_tagged_input})
             print(f"\n[智能体] > {response['output']}")
         except Exception as e:

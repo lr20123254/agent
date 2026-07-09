@@ -213,52 +213,68 @@ def _read_file(path: Path) -> Optional[str]:
 
 
 def _read_pdf(path: Path) -> str:
-    """读取 PDF 文件（文本型直接提取，扫描件自动 OCR 识别）"""
+    """读取 PDF 文件（文本型直接提取，扫描件/混合型逐页 OCR）"""
     from pypdf import PdfReader
 
     reader = PdfReader(str(path))
     num_pages = len(reader.pages)
-
-    # 先尝试提取文本
-    text_parts = []
-    for page in reader.pages:
-        t = page.extract_text()
-        if t:
-            text_parts.append(t)
-
-    extracted_text = "\n\n".join(text_parts)
-    total_chars = len(extracted_text.strip())
-
-    # 判断是否为扫描件：每页平均字符数 < 50 则视为扫描件
-    threshold_per_page = 50
-    if num_pages > 0 and total_chars // num_pages < threshold_per_page:
-        logger.info(f"PDF 文本内容过少 (平均 {total_chars//max(num_pages,1)} 字符/页)，"
-                    f"启用 OCR 识别: {path.name}")
-        return _ocr_pdf(path, reader, num_pages)
-
-    return extracted_text
-
-
-def _ocr_pdf(path: Path, reader, num_pages: int) -> str:
-    """用 OCR 扫描 PDF 每页图片"""
-    ocr = _get_ocr_reader()
     all_text = []
 
     for page_num in range(num_pages):
         page = reader.pages[page_num]
-        # 尝试用 pypdf 提取嵌入式图片
-        try:
-            for img_idx, image in enumerate(page.images):
-                img_data = image.data
-                # OCR 识别图片中的文字
-                result = ocr.readtext(img_data, detail=0, paragraph=True)
-                if result:
-                    all_text.append(f"\n--- 第 {page_num + 1} 页 (图片 {img_idx + 1}) ---")
-                    all_text.extend(result)
-        except Exception:
-            pass
 
-    text = "\n".join(all_text)
+        # 1. 先尝试提取文本
+        text = page.extract_text() or ""
+        text = text.strip()
+
+        # 2. 如果文本太少（< 50 字符），用 OCR 识别该页
+        if len(text) < 50:
+            logger.info(f"  第 {page_num + 1} 页文本不足 ({len(text)} 字符)，启用 OCR")
+            ocr_text = _ocr_page(path, page_num)
+            if ocr_text:
+                all_text.append(f"\n--- 第 {page_num + 1} 页 (OCR) ---\n{ocr_text}")
+            continue
+
+        all_text.append(text)
+
+    return "\n\n".join(all_text)
+
+
+def _ocr_page(pdf_path: Path, page_num: int) -> str:
+    """OCR 识别 PDF 的指定页（用 PyMuPDF 渲染为图片 → easyocr）"""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning("PyMuPDF 未安装，跳过 OCR")
+        return ""
+
+    ocr = _get_ocr_reader()
+    try:
+        doc = fitz.open(str(pdf_path))
+        page = doc[page_num]
+
+        # 渲染为图片（300 DPI，保证清晰度）
+        zoom = 300 / 72  # 默认 72 DPI → 300 DPI
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+
+        # 转换为 numpy 数组（RGB）
+        import numpy as np
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
+        if pix.n == 4:  # RGBA → RGB
+            img = img[:, :, :3]
+
+        doc.close()
+
+        # OCR 识别
+        result = ocr.readtext(img, detail=0, paragraph=True)
+        return "\n".join(result) if result else ""
+
+    except Exception as e:
+        logger.warning(f"第 {page_num + 1} 页 OCR 失败: {e}")
+        return ""
     logger.info(f"OCR 识别完成: {path.name}, {len(text)} 字符")
     return text
 
