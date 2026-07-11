@@ -40,10 +40,10 @@ if sys.platform == "win32":
     sys.stdout.write = _make_safe_writer(sys.stdout.write)
     sys.stderr.write = _make_safe_writer(sys.stderr.write)
 
-from tools import web_search, read_file, write_file
+from tools import web_search, read_file, write_file, ocr_image
 from tools.rag import knowledge_search, graph_search, set_llm, ingest_file, ingest_directory, get_kb_stats, run_evaluation, build_graph, graph_stats
 
-tools = [web_search, read_file, write_file, knowledge_search, graph_search]
+tools = [web_search, read_file, write_file, ocr_image, knowledge_search, graph_search]
 
 # ── 模型初始化（中转站 / OpenAI 兼容） ──────────────
 api_key = os.getenv("OPENAI_API_KEY", "")
