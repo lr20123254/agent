@@ -3,15 +3,19 @@
 核心工具：
   - knowledge_search: 混合检索（向量+BM25+Reranker），适合具体事实查询
   - graph_search: 知识图谱检索，适合全局性/主题性查询
+
+Corrective RAG 流程：
+  检索 → 相关性评分 → 低分？→ 改写查询重试 → 仍低分？→ 联网搜索兜底
 """
 
 import logging
+import re
 
 from langchain.tools import tool
 
-from .retriever import hybrid_search, simple_search, _assess_confidence, set_llm
+from .retriever import hybrid_search, simple_search, set_llm, rewrite_query, _llm_instance
 from .graph_rag import graph_search as _graph_search
-from .graph_rag import format_graph_results, load_graph
+from .graph_rag import format_graph_results
 
 logger = logging.getLogger(__name__)
 
@@ -27,44 +31,40 @@ def knowledge_search(query: str) -> str:
     参数 query 请尽量详细、具体，以获得最佳检索效果。
     """
     try:
-        results = _do_search(query)
+        results, chain = _corrective_search(query)
+
         if not results:
             return "知识库中未找到与查询相关的内容。你可以先使用 /ingest 命令导入文档。"
 
-        # 置信度评估
-        confidence_level, needs_secondary = _assess_confidence(results)
-        confidence_tag = {
-            "high": "✅ 高置信度",
-            "medium": "⚠️ 中置信度（可能不完整）",
-            "low": "❓ 低置信度（建议补充搜索）",
-        }.get(confidence_level, "")
+        # 构建输出
+        top_score = results[0].get("score", 0)
+        tag = "✅ 高置信度" if top_score >= 8 else (
+            "⚠️ 中置信度" if top_score >= 5 else "❓ 低置信度"
+        )
 
-        output = [
-            f"在知识库中找到 {len(results)} 条相关结果{confidence_tag}：\n"
-        ]
-
+        output = [f"在知识库中找到 {len(results)} 条相关结果 {tag}：\n"]
         for i, r in enumerate(results, 1):
             text = r["text"].strip()
-            source = r.get("source", "")
             score = r.get("score", 0)
+            source = r.get("source", "")
             confidence = r.get("confidence", "medium")
-
-            # 置信度标签
             badge = {"high": "⭐⭐⭐", "medium": "⭐⭐", "low": "⭐",
-                     "supplement": "📎"}.get(confidence, "⭐")
-
+                     "supplement": "📎", "web": "🌐"}.get(confidence, "⭐")
             if len(text) > 600:
                 text = text[:600] + "..."
-
             output.append(f"[{i}] {badge} 评分: {score} | 来源: {source}")
             output.append(f"    {text}\n")
 
-        # 低置信度提示
-        if needs_secondary and confidence_level != "high":
-            output.append(
-                "💡 提示：以上结果置信度一般，建议补充更精确的查询，"
-                "或结合联网搜索获取完整信息。"
-            )
+        # 显示纠正链
+        if chain:
+            hints = {
+                "rewritten": "（已尝试查询改写，仍无满意结果）",
+                "web_fallback": "（知识库无结果，以下为联网搜索结果）",
+                "direct": "",
+            }
+            hint = hints.get(chain[-1], "")
+            if hint:
+                output.append(f"💡 {hint}")
 
         return "\n".join(output)
 
@@ -73,39 +73,90 @@ def knowledge_search(query: str) -> str:
         return f"知识库检索出错: {e}"
 
 
-def _do_search(query: str) -> list:
-    """执行搜索，优先 hybrid，回退 simple"""
+# ── Corrective RAG 核心逻辑 ───────────────────────
+
+
+def _grade_relevance(results: list, threshold: float = 5.0) -> bool:
+    """判断检索结果是否足够相关。返回 True = 足够好，False = 需要纠正"""
+    if not results:
+        return False
+    # 取 top-1 和 top-3 平均分
+    top1 = results[0].get("score", 0)
+    avg_top3 = sum(r.get("score", 0) for r in results[:3]) / min(3, len(results))
+    # 至少有一条高分 或 整体平均不错
+    return top1 >= threshold or avg_top3 >= threshold - 1.0
+
+
+def _corrective_search(query: str) -> tuple:
+    """Corrective RAG 搜索：检索 → 评分 → 改写重试 → 联网兜底
+
+    Returns:
+        (results, chain)
+        results: 检索结果列表
+        chain: 纠正链路标记 ["direct", "rewritten", "web_fallback"]
+    """
     top_k = 5
+    chain = []
 
-    # 尝试 Hybrid Search
+    # ── 第 1 次检索 ──────────────────────────
+    results = _try_search(query, top_k)
+    if _grade_relevance(results):
+        return results, ["direct"]
+
+    # ── 低分 → 查询改写后重试 ────────────────
+    logger.info("Corrective RAG: 检索质量不足，尝试查询改写")
+    chain.append("rewritten")
+    rewritten = rewrite_query(query)
+    if rewritten and rewritten != query:
+        results2 = _try_search(rewritten, top_k)
+        if _grade_relevance(results2):
+            return results2, chain
+
+    # ── 仍低分 → 联网搜索兜底 ────────────────
+    logger.info("Corrective RAG: 改写仍不足，联网搜索兜底")
+    chain.append("web_fallback")
+    web_results = _web_search_fallback(query)
+    if web_results:
+        return web_results, chain
+
+    return [], chain
+
+
+def _try_search(query: str, top_k: int) -> list:
+    """尝试一次检索（hybrid → simple 两级回退）"""
     try:
-        results = hybrid_search(query, top_k=top_k, enable_rewrite=True)
-        if results:
-            logger.info(f"Hybrid search 返回 {len(results)} 条结果")
-            return results
-        else:
-            logger.info("Hybrid search 返回空结果")
+        r = hybrid_search(query, top_k=top_k, enable_rewrite=False)
+        if r:
+            return r
     except Exception as e:
-        logger.warning(f"Hybrid search 失败: {e}")
-
-    # 回退到纯向量检索
+        logger.warning(f"hybrid_search 失败: {e}")
     try:
-        results = simple_search(query, top_k=top_k)
-        if results:
-            logger.info(f"Simple search 返回 {len(results)} 条结果（回退）")
-            return results
+        r = simple_search(query, top_k=top_k)
+        if r:
+            return r
     except Exception as e:
-        logger.warning(f"Simple search 也失败: {e}")
-
-    # 最终尝试：用原始查询做一次最简单的向量检索
-    try:
-        results = simple_search(query, top_k=top_k)
-        if results:
-            return results
-    except Exception:
-        pass
-
+        logger.warning(f"simple_search 失败: {e}")
     return []
+
+
+def _web_search_fallback(query: str) -> list:
+    """联网搜索兜底：调用 web_search 工具，包装为统一格式"""
+    try:
+        from tools.web_search import web_search
+        result_text = web_search.invoke(query)
+        # 包装为统一格式
+        return [{
+            "text": result_text,
+            "score": 3.0,
+            "confidence": "web",
+            "source": "🌐 联网搜索（知识库无匹配）",
+            "parent_id": "",
+            "chunk_id": "",
+            "original_query": query,
+        }]
+    except Exception as e:
+        logger.warning(f"联网搜索兜底失败: {e}")
+        return []
 
 
 @tool
